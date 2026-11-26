@@ -58,21 +58,41 @@ jobs:
             VERSION="${VERSION#dsh-v}"
             echo "使用手动指定版本: ${VERSION}"
           else
-            # 取上游最新 release tag
-            # 官方 tag 形如 dsh-v0.2.3-alpha.1
-            RAW_TAG=$(curl -fsSL \
+            # 取上游版本号
+            #
+            # 注意：不能用 /releases/latest
+            #   该接口只返回「非预发布」的正式版；dsh 目前所有 release
+            #   都标记为 prerelease（alpha/rc），所以该接口恒返回 404。
+            #
+            # 改用 /releases 列表 + 本地按 semver 排序取最高版本。
+            # 不用列表第一个，是因为「最近发布」可能是在老分支上补的
+            # rc 版本，会导致版本回退。
+            RELEASES_JSON=$(curl -fsSL \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
-              | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=50") || {
+                echo "::error::调用 GitHub API 失败"
+                exit 1
+              }
 
-            if [ -z "${RAW_TAG}" ]; then
-              echo "::error::无法获取上游 latest release"
+            ALL_VERSIONS=$(echo "${RELEASES_JSON}" \
+              | grep -oP '"tag_name":\s*"\K[^"]+' \
+              | sed 's/^dsh-v//' \
+              | grep -P '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$' \
+              || true)
+
+            if [ -z "${ALL_VERSIONS}" ]; then
+              echo "::error::上游 release 列表为空或格式不匹配"
+              echo "原始响应前 500 字符："
+              echo "${RELEASES_JSON}" | head -c 500
               exit 1
             fi
 
-            VERSION="${RAW_TAG#dsh-v}"
-            echo "上游最新 tag=${RAW_TAG} -> version=${VERSION}"
+            echo "上游可选版本（sort -V 排序后）："
+            echo "${ALL_VERSIONS}" | sort -V | sed 's/^/  /'
+
+            VERSION=$(echo "${ALL_VERSIONS}" | sort -V | tail -1)
+            echo "选中版本: ${VERSION}"
           fi
 
           # 校验版本号格式（允许 semver + 预发布后缀）
