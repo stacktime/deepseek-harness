@@ -210,18 +210,19 @@ jobs:
           IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.version }}"
           echo "start smoke test with ${IMG}"
 
-          # 多架构镜像本机是 amd64，docker run 会自动选匹配架构
           docker run -d --name dsh-smoke -p 3080:3080 "${IMG}"
 
+          # 注意：dsh 首页 302 到 /?token=xxx，curl -f 会把 3xx 判为失败。
+          # 这里只看是否拿到 HTTP 响应码（非 000 即视为已监听）。
           READY=false
-          # 最多等 150 秒（容器首次启动要装配置 + socat 就绪）
-          for i in $(seq 1 75); do
-            if curl -fsS --max-time 3 http://127.0.0.1:3080/ >/dev/null 2>&1; then
-              echo "smoke test passed after $((i*2))s"
+          for i in $(seq 1 90); do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
+              http://127.0.0.1:3080/ 2>/dev/null || echo "000")
+            if [ "${CODE}" != "000" ]; then
+              echo "smoke test passed after $((i*2))s (HTTP ${CODE})"
               READY=true
               break
             fi
-            # 容器异常退出则立刻失败
             if ! docker ps --filter name=dsh-smoke --filter status=running -q | grep -q .; then
               echo "::error::container exited unexpectedly"
               break
@@ -230,7 +231,7 @@ jobs:
           done
 
           echo "--- container logs ---"
-          docker logs dsh-smoke 2>&1 | tail -50 || true
+          docker logs dsh-smoke 2>&1 | tail -60 || true
 
           docker rm -f dsh-smoke >/dev/null 2>&1 || true
 
