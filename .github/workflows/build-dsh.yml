@@ -119,19 +119,36 @@ jobs:
           fi
 
           # 查 GHCR 上是否已有该版本 tag
-          TOKEN=$(curl -fsSL \
+          #
+          # 注意：这一步是「优化」（避免重复构建），不是「必要条件」。
+          # 任何异常（包不存在时匿名 token 会被 403 拒绝、网络抖动、
+          # 首次构建时包还不存在）都必须降级为「需要构建」，不能中断 job。
+
+          CODE="000"
+
+          # 1) 取匿名 pull token（包首次不存在时 GHCR 返回 403，属正常）
+          TOKEN=$(curl -sS --max-time 20 \
             "https://ghcr.io/token?scope=repository:${IMAGE_NAME}:pull&service=ghcr.io" \
-            | grep -oP '"token":\s*"\K[^"]+')
+            2>/dev/null \
+            | grep -oP '"token":\s*"\K[^"]+' || true)
 
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${TOKEN}" \
-            "https://ghcr.io/v2/${IMAGE_NAME}/manifests/${VERSION}")
+          if [ -n "${TOKEN}" ]; then
+            # 2) 用 token 查 manifest 是否存在
+            CODE=$(curl -sS --max-time 20 -o /dev/null \
+              -w '%{http_code}' \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/${IMAGE_NAME}/manifests/${VERSION}" \
+              2>/dev/null || echo "000")
+            echo "GHCR manifest 查询结果: HTTP ${CODE}"
+          else
+            echo "GHCR token 获取失败（包可能尚不存在），视为需要构建"
+          fi
 
-          if [ "$CODE" = "200" ]; then
+          if [ "${CODE}" = "200" ]; then
             echo "镜像 ${VERSION} 已存在，跳过构建"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "镜像 ${VERSION} 不存在（HTTP $CODE），准备构建"
+            echo "镜像 ${VERSION} 未找到（HTTP ${CODE}），准备构建"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -189,20 +206,38 @@ jobs:
       - name: Smoke test image
         run: |
           set -euo pipefail
+
           IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.version }}"
-          docker run -d --name dsh-smoke -p 3080:3080 "$IMG"
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:3080/ >/dev/null 2>&1; then
-              echo "smoke test passed"
-              docker rm -f dsh-smoke
-              exit 0
+          echo "start smoke test with ${IMG}"
+
+          # 多架构镜像本机是 amd64，docker run 会自动选匹配架构
+          docker run -d --name dsh-smoke -p 3080:3080 "${IMG}"
+
+          READY=false
+          # 最多等 150 秒（容器首次启动要装配置 + socat 就绪）
+          for i in $(seq 1 75); do
+            if curl -fsS --max-time 3 http://127.0.0.1:3080/ >/dev/null 2>&1; then
+              echo "smoke test passed after $((i*2))s"
+              READY=true
+              break
+            fi
+            # 容器异常退出则立刻失败
+            if ! docker ps --filter name=dsh-smoke --filter status=running -q | grep -q .; then
+              echo "::error::container exited unexpectedly"
+              break
             fi
             sleep 2
           done
-          echo "::error::smoke test failed - container did not respond"
-          docker logs dsh-smoke
-          docker rm -f dsh-smoke
-          exit 1
+
+          echo "--- container logs ---"
+          docker logs dsh-smoke 2>&1 | tail -50 || true
+
+          docker rm -f dsh-smoke >/dev/null 2>&1 || true
+
+          if [ "${READY}" != "true" ]; then
+            echo "::error::smoke test failed - service did not respond on :3080"
+            exit 1
+          fi
 
       - name: Job summary
         if: always()
