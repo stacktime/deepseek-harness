@@ -1,0 +1,49 @@
+name: dsh
+
+services:
+  dsh:
+    # 二选一：
+    #   A. 用 GHCR 上自己构建的镜像（推荐，版本可控）
+    image: ghcr.io/YOUR_GITHUB_USER/dsh:latest
+    #   B. 本地构建
+    # build:
+    #   context: .
+    #   args:
+    #     DSH_VERSION: 0.2.3-alpha.1
+
+    container_name: dsh
+    restart: unless-stopped
+
+    ports:
+      # 只绑回环，本机访问；要给局域网用改成 0.0.0.0 或加反向代理
+      - "127.0.0.1:3080:3080"
+
+    environment:
+      TZ: Asia/Shanghai
+      # 凭证优先级：环境变量 > .credentials.yaml > .env
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DSH_HOME: /data/dsh
+
+    volumes:
+      # 会话、配置、凭证、profile 全在这里，必须持久化
+      - dsh-data:/data/dsh
+      # 交给 Agent 操作的代码目录
+      - ./workspace:/workspace
+
+    # dsh 资源占用不高，但长任务会吃内存；按需调整
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3080/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  dsh-data:
