@@ -1,0 +1,199 @@
+name: Build dsh image
+
+# ============================================================
+# 两种触发方式：
+#   1. 定时轮询（主力）：每 6 小时查一次上游 release，有新版就构建
+#   2. 手动：填任意版本号立即构建（补历史版本/重跑失败）
+#
+# 为什么不用 fork 同步来触发：
+#   GITHUB_TOKEN 推送的 commit 不会触发 workflow（GitHub 防递归机制），
+#   用 fork 同步当触发器不可靠。直接读上游 release 更稳，且与 fork 解耦。
+# ============================================================
+
+on:
+  schedule:
+    # 每 6 小时，UTC 时间。官方发版后最迟 6 小时内自动出镜像
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'dsh 版本号（不带 dsh-v 前缀，如 0.2.3-alpha.1）；留空则取上游最新 release'
+        required: false
+        type: string
+      force:
+        description: '强制重建（镜像已存在也重新构建）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: deepseek-ai/deepseek-harness
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/dsh
+
+jobs:
+  resolve-version:
+    name: Resolve upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            # 手动指定版本
+            VERSION="${INPUT_VERSION}"
+            # 允许用户误带 dsh-v 前缀
+            VERSION="${VERSION#dsh-v}"
+            echo "使用手动指定版本: ${VERSION}"
+          else
+            # 取上游最新 release tag
+            # 官方 tag 形如 dsh-v0.2.3-alpha.1
+            RAW_TAG=$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+              | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+
+            if [ -z "${RAW_TAG}" ]; then
+              echo "::error::无法获取上游 latest release"
+              exit 1
+            fi
+
+            VERSION="${RAW_TAG#dsh-v}"
+            echo "上游最新 tag=${RAW_TAG} -> version=${VERSION}"
+          fi
+
+          # 校验版本号格式（允许 semver + 预发布后缀）
+          if ! echo "${VERSION}" | grep -qP '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "::error::版本号格式非法: ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "强制重建，跳过存在性检查"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 查 GHCR 上是否已有该版本 tag
+          TOKEN=$(curl -fsSL \
+            "https://ghcr.io/token?scope=repository:${IMAGE_NAME}:pull&service=ghcr.io" \
+            | grep -oP '"token":\s*"\K[^"]+')
+
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/${IMAGE_NAME}/manifests/${VERSION}")
+
+          if [ "$CODE" = "200" ]; then
+            echo "镜像 ${VERSION} 已存在，跳过构建"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "镜像 ${VERSION} 不存在（HTTP $CODE），准备构建"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ needs.resolve-version.outputs.version }}
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.resolve-version.outputs.version }}
+            type=raw,value=latest
+            type=raw,value=sha-${{ github.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.title=DeepSeek Harness
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+          build-args: |
+            DSH_VERSION=${{ needs.resolve-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.version }}"
+          docker run -d --name dsh-smoke -p 3080:3080 "$IMG"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3080/ >/dev/null 2>&1; then
+              echo "smoke test passed"
+              docker rm -f dsh-smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::smoke test failed - container did not respond"
+          docker logs dsh-smoke
+          docker rm -f dsh-smoke
+          exit 1
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### dsh 镜像构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 版本 | \`${{ needs.resolve-version.outputs.version }}\` |"
+            echo "| 镜像 | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.version }}\` |"
+            echo "| 平台 | linux/amd64, linux/arm64 |"
+            echo "| 状态 | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
