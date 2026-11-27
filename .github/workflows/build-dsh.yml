@@ -179,10 +179,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # 只打两个 tag：具体版本号 + latest
+          # 不额外打 sha-<commit> tag —— 每次构建都会新增一个，会让 tag 列表逐渐变长。
+          # 需要追溯某次构建时，用 Actions 页面（run 记录里有 commit sha 和镜像 digest）。
           tags: |
             type=raw,value=${{ needs.resolve-version.outputs.version }}
             type=raw,value=latest
-            type=raw,value=sha-${{ github.sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -239,6 +241,62 @@ jobs:
             echo "::error::smoke test failed - service did not respond on :3080"
             exit 1
           fi
+
+      - name: Prune legacy sha-* tags
+        # 历史遗留：早期配置给每次构建额外打了 sha-<commit> tag。
+        # 这里清掉它们，只保留「版本号」和「latest」。
+        # 注意：删除 tag 不会删除镜像层（同一个 digest 仍被版本号 tag 引用）。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          KEEP_VERSION="${{ needs.resolve-version.outputs.version }}"
+          echo "保留 tag: ${KEEP_VERSION}, latest"
+
+          # 列出全部 tag
+          TOKEN=$(curl -sS --max-time 20 \
+            "https://ghcr.io/token?scope=repository:${IMAGE_NAME}:pull,delete&service=ghcr.io" \
+            2>/dev/null | grep -oP '"token":\s*"\K[^"]+' || true)
+
+          if [ -z "${TOKEN}" ]; then
+            echo "::warning::无法获取 GHCR token，跳过清理"
+            exit 0
+          fi
+
+          TAGS=$(curl -sS --max-time 20 \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/${IMAGE_NAME}/tags/list" 2>/dev/null \
+            | grep -oP '"tags":\[[^\]]*\]' \
+            | grep -oP '"[^"]+"' | tr -d '"' | grep -v '^tags$' || true)
+
+          echo "当前 tags:"
+          echo "${TAGS}" | sed 's/^/  /'
+
+          DELETED=0
+          for TAG in ${TAGS}; do
+            case "${TAG}" in
+              latest|"${KEEP_VERSION}")
+                continue
+                ;;
+              sha-*)
+                echo "删除 legacy tag: ${TAG}"
+                CODE=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X DELETE \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+                  "https://ghcr.io/v2/${IMAGE_NAME}/manifests/${TAG}" 2>/dev/null || echo "000")
+                echo "  -> HTTP ${CODE}"
+                DELETED=$((DELETED+1))
+                ;;
+              *)
+                # 其他历史版本号 tag：默认保留（可作为回滚点）
+                echo "保留历史版本 tag: ${TAG}"
+                ;;
+            esac
+          done
+
+          echo "已清理 ${DELETED} 个 sha-* tag"
 
       - name: Job summary
         if: always()
