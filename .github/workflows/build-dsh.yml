@@ -202,8 +202,15 @@ jobs:
             DSH_VERSION=${{ needs.resolve-version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
+          # provenance / sbom 关闭说明：
+          #   开启时，每个架构额外生成一个 attestation manifest，其内部含
+          #   2 个 layer（SBOM 证明 + provenance 证明）+ 1 个空配置 blob。
+          #   在 GHCR 的 versions 页面表现为多个 untagged 条目，
+          #   两个架构合计约 5 个 untagged。
+          #   个人自用镜像无需供应链证明，关闭后 versions 只剩
+          #   amd64 / arm64 两个真正的镜像条目。
+          provenance: false
+          sbom: false
 
       - name: Smoke test image
         run: |
